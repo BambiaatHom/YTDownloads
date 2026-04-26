@@ -1,0 +1,7 @@
+pytubefix
+spotipy
+rich
+mutagen
+plyer
+yt-dlp
+
