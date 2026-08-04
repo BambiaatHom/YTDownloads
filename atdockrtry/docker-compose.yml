@@ -1,0 +1,16 @@
+services:
+  downloader:
+    build: .
+    container_name: yt_spotify_downloader
+    tty: true            # Allows interactive terminal (needed for TUI)
+    stdin_open: true     # Allows you to type into the script
+    volumes:
+      # Map your music downloads from Proxmox host to the container
+      - ./downloads:/app/downloads
+      
+      # Map your config and cache so you don't lose Spotify login!
+      # This points the container to the folders on your Proxm_host
+      - ./config:/app/config
+      - ./cache:/app/.cache-spotify 
+    restart: unless-stopped
+
