@@ -168,7 +168,7 @@ class FailedLog:
     """Tracks failed downloads for later retry."""
     def __init__(self):
         self.path = FAILED_LOG
-        self.entries = self._load
+        self.entries = self._load()
     def _load(self):
         """Load failed entries from the log file."""
         if self.path.exists():
@@ -188,7 +188,7 @@ class FailedLog:
         self.entries = []
         self.save()
     def count(self) -> int:
-        return len(self.entries())
+        return len(self.entries)
 #--Youtube stuff----------------------------------------
 def score_youtube_match(query: str, video_title: str, video_duration: int, expected_duration: int = None) -> Tuple[float, str]:
     score = 0.0
@@ -244,6 +244,13 @@ def find_best_youtube_match(query: str, artist: str = "", expected_duration: int
         'quiet': True,                               # Suppress log spams
         'no_warnings': True,
         'extract_flat': True,                        # Quick extraction of search listings
+        'impersonate': 'chrome', 
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'default', '-android_sdkless'],
+                'player_skip': ['webpage', 'configs']
+            }
+        },
     }
 
     try:
@@ -374,7 +381,7 @@ def get_subdirs(base: str | Path) -> tuple[Path, Path]:
 class  SpotifyManager:
     def __init__(self,cfg:dict):
         self.cfg = cfg
-        self.cfg = None
+        self.sp = None
     def setup_spotify(self) -> bool:
         """Spotify authentification returns true if successful"""
         SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8118/callback"
@@ -753,25 +760,43 @@ def download_video_merged(url: str, out_dir: Path) -> Optional[Path]:
     if not check_ffmpeg():
         console.print("[danger]Error: FFmpeg required for high quality video formats![/danger]")
         return None
+    outtmpl_str = str(out_dir / '%(title)s.%(ext)s')
+
     #yt-dlp layout config options
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',  # Grabs best visual and best audio streams
         'merge_output_format': 'mp4',           # Enforces merging into standard MP4
-        'outtmpl': str(out_dir / '%(title)s.%(ext)s'), # Safe cross-platform file naming template
+        'outtmpl': outtmpl_str,
+        'restrictfilenames': True,
         'quiet': True,
         'no_warnings': True,
+        'no_colour': True,
+        'compat_opts': {'no-youtube-channel-redirect'},
+        'impersonate': 'chrome', 
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'default', '-android_sdkless'],
+                'player_skip': ['webpage', 'configs']
+            }
+        },
     }
+    cookie_path = Path.cwd() / ".youtube_cookies.txt"
+    if cookie_path.exists() and cookie_path.stat().st_size > 0:
+        ydl_opts['cookiefile'] = str(cookie_path)
     try:
         console.print(f"[info]Downloading high quality video...[/info]")
         with YoutubeDL(ydl_opts) as ydl:
             #extract metadata and download
             info = ydl.extract_info(url, download=True)
+            if not info or 'title' not in info:
+                raise ValueError("Incomplete video information extracted.")
             final_file = Path(ydl.prepare_filename(info)).with_suffix('.mp4')
             console.print(f"[success]✔ Downloaded and merged: {final_file.name}[/success]")
             return final_file
     except Exception as e:
         console.print(f"[danger]Error during video download merge pipeline: {e}[/danger]")
         return None
+    
 def download_audio_format(video_url: str, out_dir: Path, format_choice: str,
                           song_meta: dict = None, db: LibraryDB = None,
                           normalize: bool = False, yes_all: bool = False) -> Optional[Path]:
@@ -797,6 +822,13 @@ def download_audio_format(video_url: str, out_dir: Path, format_choice: str,
             'preferredcodec': fmt,
             'preferredquality': bitrate,
         }],
+        'impersonate': 'chrome', 
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'default', '-android_sdkless'],
+                'player_skip': ['webpage', 'configs']
+            }
+        },
     }
 
     try:
@@ -814,7 +846,7 @@ def download_audio_format(video_url: str, out_dir: Path, format_choice: str,
             title = song_meta.get("name", "Unknown Title")
             artist = song_meta.get("artist", "Unknown Artist")
             album = song_meta.get("album", "")
-            art_url = song_meta.get("art_url", "")
+            art_url = song_meta.get("album_art_url", "")
         else:
             # Slicing native yt-dlp key metrics cleanly
             title = info.get('title', 'Unknown Title') or "Unknown Title"
@@ -858,7 +890,7 @@ def sync_browser_cookies(browser_name: str = "brave") -> Optional[str]:
     
     # Configure yt-dlp to extract cookies from your browser and save them locally
     ydl_opts = {
-        'cookiesfrombrowser': (browser_name,),
+        'cookiesfrombrowser': [browser_name],
         'cookiefile': str(cookie_file_path),
         'quiet': True,
         'no_warnings': True,
@@ -968,7 +1000,7 @@ def show_stats_screen(db: Any) -> None:
     console.print(Rule("[info]📊 Download Library Stats[/info]"))
 
     # 1. Overview panel configuration layout handles
-    total_tracks = stats.get("total", 0)
+    total_tracks = stats.get("total_tracks", 0)
     total_bytes = stats.get("total_size", 0) or 0
     size_str = fmt_size(total_bytes)
     
@@ -1047,15 +1079,21 @@ def show_native_metadata(info_dict: Dict) -> None:
             f"[bold white]Date:[/]       {formatted_date}"
         )
         console.print(Panel(info_panel, title="[title] Video info[/title]", border_style="blue"))
-def video_menu(info_dict: dict, base_path: str) -> str:
+def video_menu(info_dict: dict, base_path: str, db: LibraryDB = None, failed_log: FailedLog = None) -> str:
     """Video menu using yt-dlp dictionary data"""
     v_dir, a_dir = get_subdirs(base_path)
     has_ffmpeg  = check_ffmpeg()
-    #extract vidio link at the start
-    video_url = info_dict.get('webpage_irl')
+    
+    # ◄ CRITICAL FIX: Changed 'webpage_irl' to 'webpage_url'
+    video_url = info_dict.get('webpage_url')
+    
+    # Cookie path guard for all option blocks
+    cookie_path = Path.cwd() / ".youtube_cookies.txt"
+    has_cookies = cookie_path.exists() and cookie_path.stat().st_size > 0
+
     while True:
         console.print(Rule(style="cyan"))
-        show_native_metadata(info_dict)#
+        show_native_metadata(info_dict)
         console.print("[info]Actions:[/info]")
         if has_ffmpeg:
             console.print("  [bold yellow]1[/bold yellow]  Best Quality Video (1080p/4K + Audio Merge)")
@@ -1071,47 +1109,87 @@ def video_menu(info_dict: dict, base_path: str) -> str:
         choice = Prompt.ask("[info]Choice:[/info]")
         if choice == "q": return "quit"
         if choice == "b": return "back"
+        
         if choice == "1":
             if has_ffmpeg:
-                download_video_merged(video_url, base_path)
+                # Forward arguments down into the native high-res pipeline
+                # (You may want to update download_video_merged's definition to accept db/failed_log later)
+                download_video_merged(video_url, v_dir)
             else:
                 console.print("[warning]FFmpeg not found. Install it to enable 1080p/4K.[/warning]")
                 continue
+                
         elif choice == "2":
             ydl_opts = {
                 'format': 'bestvideo[height<=720]+bestaudio/best',
                 'merge_output_format': 'mp4',
                 'outtmpl': str(v_dir / '%(title)s.%(ext)s'),
                 'quiet': True,
+                'impersonate': 'chrome', 
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['web', 'default', '-android_sdkless'],
+                        'player_skip': ['webpage', 'configs']
+                    }
+                },
             }
+            if has_cookies: ydl_opts['cookiefile'] = str(cookie_path)
+            
             with console.status("[bold cyan]Download standard 720p video", spinner="dots"):
                 try:
                     with YoutubeDL(ydl_opts) as ydl:
                         ydl.download([video_url])
                     console.print("[success]✔ Standard video downloaded successfully![/success]")
+                    
+                    # ◄ DB HOOK PLACEHOLDER: Save successful history item
+                    # if db: db.add_track(info_dict.get('title'), info_dict.get('id'), "video")
                 except Exception as e:
                     console.print(f"[danger]Download failed: {e}[/danger]")
+                    # ◄ FAILED LOG PLACEHOLDER: Save failed item
+                    # if failed_log: failed_log.add(video_url, str(e))
+                    
         elif choice == "3":
             ydl_opts = {
                 'format': 'bestaudio[ext=m4a]/bestaudio',
                 'outtmpl': str(a_dir / '%(title)s.%(ext)s'),
                 'quiet': True,
+                'impersonate': 'chrome', 
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['web', 'default', '-android_sdkless'],
+                        'player_skip': ['webpage', 'configs']
+                    }
+                },
             }
+            if has_cookies: ydl_opts['cookiefile'] = str(cookie_path)
+            
             with console.status("[bold cyan]Extracting M4A audio...", spinner="dots"):
                 try:
                     with YoutubeDL(ydl_opts) as ydl:
                         ydl.download([video_url])
                     console.print("[success]✔ Audio track saved successfully![/success]")
+                    # if db: db.add_track(info_dict.get('title'), info_dict.get('id'), "audio")
                 except Exception as e:
                     console.print(f"[danger]Download failed: {e}[/danger]")
+                    # if failed_log: failed_log.add(video_url, str(e))
+                    
         elif choice == "4":
             ydl_opts = {
                 'writesubtitles': True,
                 'allsubtitles': True,
-                'skip_download': True, # Tells yt-dlp to only download text, no video packets!
+                'skip_download': True, 
                 'outtmpl': str(v_dir / '%(title)s.%(ext)s'),
                 'quiet': True,
+                'impersonate': 'chrome', 
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['web', 'default', '-android_sdkless'],
+                        'player_skip': ['webpage', 'configs']
+                    }
+                },
             }
+            if has_cookies: ydl_opts['cookiefile'] = str(cookie_path)
+            
             with console.status("[bold cyan]Fetching captions/subtitles/lyrics...", spinner="dots"):
                 try:
                     with YoutubeDL(ydl_opts) as ydl:
@@ -1119,8 +1197,10 @@ def video_menu(info_dict: dict, base_path: str) -> str:
                     console.print("[success]✔ Subtitles saved into your videos folder![/success]")
                 except Exception as e:
                     console.print(f"[danger]Failed to extract captions: {e}[/danger]")
+                    
         elif choice == "5":
             format_selection_menu(video_data=info_dict, out_dir=a_dir)
+            
         if Confirm.ask("[info]Perform another action on this video?[/info]", default=False):
             continue
         return "back"
@@ -1229,7 +1309,7 @@ def bulk_download_songs(songs: List[Dict], base_path: str, org_choice: str,
         output_folder.mkdir(parents=True, exist_ok=True)
         #Youtbe match with confidence
         query = song.get("search_query", song.get("name", ""))
-        expected_dur = song.get("duration_ms", 0) // 1000 if song.get("durration_ms") else None
+        expected_dur = song.get("duration_ms", 0) // 1000 if song.get("duration_ms") else None
         video, confidence, reason = find_best_youtube_match(
             query, song.get("artist", ""), expected_dur
         )
@@ -1255,7 +1335,7 @@ def bulk_download_songs(songs: List[Dict], base_path: str, org_choice: str,
             if not video_id:
                 console.print(f"  [danger]✘ Could not retrieve video ID for: {v_title}[/danger]")
                 continue
-            watch_url = f"https://youtube.com{video_id}"
+            watch_url = f"https://youtube.com/watch?v={video_id}"
             yt = YoutubeDL(watch_url, use_oauth=True, allow_oauth_cache=True, client='ANDROID_EMBED')
             result = download_audio_format(
                 yt, output_folder, format_choice,
@@ -1534,7 +1614,6 @@ def search_flow(base_path: str) -> str:
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-
         }
         with console.status("[info]Searching...[/info]"):
             try:
@@ -1630,7 +1709,7 @@ def playlist_flow(url: str, base_path: str) -> str:
         video_id = entry.get('id')
         if not video_id: continue
             
-        video_url = f"https://youtube.com{video_id}"
+        video_url = f"https://youtube.com/watch?v={video_id}"
         console.print(Rule(f"[dim]{i}/{len(entries)}: {v_title[:60]}[/dim]"))
         
         try:
@@ -1662,32 +1741,40 @@ def playlist_flow(url: str, base_path: str) -> str:
 
     console.print("[success]✔ Playlist bulk processing complete![/success]")
     return "back"
-def load_and_route(url: str, base_path: str) -> str:
+def load_and_route(url: str, base_path: str, db: LibraryDB = None, failed_log: FailedLog = None) -> str:
     is_list = "list=" in url
     try:
         if is_list:
-            return playlist_flow(url, base_path)
+            # Pass parameters forward into playlist pipeline
+            return playlist_flow(url, base_path, db=db, failed_log=failed_log)
         else:
             # ◄ NATIVE FIX: Fetch the raw information dictionary directly using yt-dlp
-            ydl_opts = {'quiet': True, 'no_warnings': True}
+            # Fix: Ensure cookies are loaded during metadata extraction to prevent throttling/errors
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'extractor_args': {'youtube': {'player_client': ['default', '-android_sdkless']}},}
+            cookie_path = Path.cwd() / ".youtube_cookies.txt"
+            if cookie_path.exists() and cookie_path.stat().st_size > 0:
+                ydl_opts['cookiefile'] = str(cookie_path)
+
             with console.status("[info]Loading native metadata via yt-dlp...[/info]"):
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
             
-            # Pass the raw dictionary cleanly to your updated native menu
-            return video_menu(info_dict=info, base_path=base_path)
+            # FIX: Pass the database and failed logging handlers downstream into your video actions engine
+            return video_menu(info_dict=info, base_path=base_path, db=db, failed_log=failed_log)
     except Exception as e:
         console.print(f"[danger]Error loading URL: {e}[/danger]")
         return "back"
 
-def direct_url_flow(base_path: str) -> str:
+def direct_url_flow(base_path: str, db: LibraryDB = None, failed_log: FailedLog = None) -> str:
+    """Processes pasted video URLs and runs tracking variables through the pipeline"""
     while True:
         console.print(Rule(style="cyan"))
         url = Prompt.ask("[info]Paste URL[/info] (or 'b' back)", default="b").strip()
         if url.lower() == "b": return "back"
         if url.lower() == "q": return "quit"
 
-        res = load_and_route(url, base_path)
+        # This ensures the pipeline doesn't drop the tracking hooks
+        res = load_and_route(url, base_path, db=db, failed_log=failed_log)
         if res == "quit": return "quit"
 
 
@@ -1759,6 +1846,9 @@ def main() -> None:
     failed_log = FailedLog()
     COOKIE_FILE = sync_browser_cookies("brave")
 
+    with YoutubeDL({'quiet': True}) as ydl:
+        ydl.cache.remove()
+
     # 3. Ultimate Interactive Dashboard Loop
     while True:
         console.print(Rule(style="blue"))
@@ -1785,10 +1875,10 @@ def main() -> None:
             break
         elif choice == "1":
             # Routes straight into your clean, native yt-dlp search engine
-            search_flow(base_path)
+            search_flow(base_path, db=db, failed_log=failed_log)
         elif choice == "2":
             # Routes straight into your raw URL processing engine
-            direct_url_flow(base_path)
+            direct_url_flow(base_path, db=db, failed_log=failed_log)
         elif choice == "3":
             if SPOTIFY_AVAILABLE:
                 spotify_import_flow(spotify_mgr, base_path, db=db, failed_log=failed_log)
