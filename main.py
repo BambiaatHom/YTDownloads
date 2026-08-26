@@ -146,16 +146,41 @@ class LibraryDB:
                 for row in raw_recent
             ]
 
+            # 5. Top artists by track count
+            self.cursor.execute("""
+                SELECT LOWER(artist), COUNT(*) 
+                FROM tracks 
+                WHERE artist IS NOT NULL AND artist != ''
+                GROUP BY LOWER(artist)
+                ORDER BY COUNT(*) DESC
+                LIMIT 10
+            """)
+            top_artists = self.cursor.fetchall()
+
+            # 6. Track count grouped by format
+            self.cursor.execute("""
+                SELECT format, COUNT(*)
+                FROM tracks
+                WHERE format IS NOT NULL AND format != ''
+                GROUP BY format
+                ORDER BY COUNT(*) DESC
+            """)
+            by_format = self.cursor.fetchall()
+
         except Exception:
             # Safe fallbacks if database is brand new and completely empty
             total_tracks, total_size, total_duration = 0, 0, 0
             recent_tracks = []
+            top_artists = []
+            by_format = []
 
         return {
             "total_tracks": total_tracks,
             "total_size": total_size,
             "total_duration": total_duration,
             "recent": recent_tracks,
+            "top_artists": top_artists,
+            "by_format": by_format,
         }
 
     def close(self):
@@ -179,9 +204,9 @@ class FailedLog:
         return []
     def save(self):
         self.path.write_text(json.dumps(self.entries, indent=2))
-    def add(self, youtube_url: str, reason: str):
+    def add(self, youtube_url: str, reason: str, source: str = ""):
         """Add a failed download"""
-        self.entries.append({"url": youtube_url, "reason": reason})
+        self.entries.append({"url": youtube_url, "reason": reason, "source": source})
         self.save()
     def clear(self):
         """Clear the failed log."""
@@ -811,9 +836,9 @@ def download_audio_format(video_url: str, out_dir: Path, format_choice: str,
     audio_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. Setup your native core options dictionary using your central cookie file
+    cookie_path = Path.cwd() / ".youtube_cookies.txt"
     ydl_opts = {
         'format': 'bestaudio/best',
-        'cookiefile': str(Path.cwd() / ".youtube_cookies.txt"), # Point straight to your synced tracker file
         'outtmpl': str(audio_dir / '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
@@ -830,6 +855,8 @@ def download_audio_format(video_url: str, out_dir: Path, format_choice: str,
             }
         },
     }
+    if cookie_path.exists() and cookie_path.stat().st_size > 0:
+        ydl_opts['cookiefile'] = str(cookie_path)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -930,7 +957,7 @@ def format_selection_menu(video_data: dict, out_dir: Path,song_meta: dict = None
     console.print("  [bold yellow]3[/bold yellow]  WAV (Lossless uncompressed)")
     console.print("  [bold yellow]4[/bold yellow]  FLAC (Lossless compressed)")
     console.print("  [bold yellow]5[/bold yellow]  OGG Vorbis")
-    console.print("  [bold yellow]6[/bold yellow]  M4A/AAC 256kbps (Original YouTube quality)")
+    console.print("  [bold yellow]6[/bold yellow]  M4A/AAC 320kbps (Original YouTube quality)")
     if not has_ffmpeg:
         console.print("\n[warning]⚠ FFmpeg required for formats 1-5[/warning]")
         console.print("[muted]Only M4A available without FFmpeg[/muted]")
@@ -968,8 +995,8 @@ def settings_menu(cfg: dict) -> str:
             return "back"
             
         elif choice == "1":
-            new_p = Prompt.ask("New Path")
-            cfg["output_path"] = new_p
+            new_p = Prompt.ask("New Path").strip()
+            cfg["output_path"] = str(Path(new_p).expanduser().resolve())
             save_config(cfg)
             console.print("[success]Saved![/success]")
         elif choice == "2":
@@ -1038,7 +1065,10 @@ def show_stats_screen(db: Any) -> None:
         t.add_column("Artist", style="cyan", max_width=30)
         t.add_column("When", style="dim")
         
-        for title, artist, when in recent:
+        for item in recent:
+            title = item.get('title', 'Unknown Track')
+            artist = item.get('artist', 'Unknown Artist')
+            when = item.get('date', '')
             if not when:
                 when_str = "Unknown Date"
             else:
@@ -1047,7 +1077,7 @@ def show_stats_screen(db: Any) -> None:
                     when_str = dt.strftime("%d %b %Y %H:%M")
                 except Exception:
                     when_str = str(when)[:16]
-            
+
             # Safe text truncation checks to ensure UI stays perfectly inline
             clean_title = str(title or "Unknown Track")
             clean_artist = str(artist or "Unknown Artist")
@@ -1300,9 +1330,9 @@ def bulk_download_songs(songs: List[Dict], base_path: str, org_choice: str,
         def safe(s): return "".join(c for c  in s if c.isalnum() or c in " -_").strip()
         if org_choice == "1":
             output_folder = a_dir / safe(folder_name)
-        if org_choice == "2":
+        elif org_choice == "2":
             output_folder = a_dir / safe(song.get("artist", "Unknown"))
-        if org_choice == "3":
+        elif org_choice == "3":
             output_folder = a_dir / safe(song.get("album", "Unknown"))
         else: #"4"
             output_folder = a_dir / safe(song.get("artist", "Unknown")) / safe(song.get("album", folder_name))
@@ -1336,9 +1366,8 @@ def bulk_download_songs(songs: List[Dict], base_path: str, org_choice: str,
                 console.print(f"  [danger]✘ Could not retrieve video ID for: {v_title}[/danger]")
                 continue
             watch_url = f"https://youtube.com/watch?v={video_id}"
-            yt = YoutubeDL(watch_url, use_oauth=True, allow_oauth_cache=True, client='ANDROID_EMBED')
             result = download_audio_format(
-                yt, output_folder, format_choice,
+                watch_url, output_folder, format_choice,
                 song_meta=song, db=db,
                 normalize=normalize, yes_all=yes_all
             )
@@ -1364,7 +1393,7 @@ def bulk_download_songs(songs: List[Dict], base_path: str, org_choice: str,
     if failed_log and failed_log.count() > 0:
         console.print(f"[muted]{failed_log.count()} total failed downloads saved to {FAILED_LOG}[/muted]")
 
-def get_bulk_options() -> Tuple[str, str, bool, bool, float]:
+def get_bulk_options() -> Tuple[str, bool, bool, float]:
     """Ask user for format, normalization, yes-all, and min confidence."""
     format_choice = get_bulk_format_choice()
     if not format_choice:
@@ -1381,7 +1410,7 @@ def get_bulk_options() -> Tuple[str, str, bool, bool, float]:
 
 def retry_failed_downloads(failed_log: FailedLog, base_path:str, db: LibraryDB) -> None:
     """Retry all failed downloads"""
-    entries = failed_log.entries()
+    entries = failed_log.entries
     if not entries:
         console.print("[info]No failed downloads to retry :) ![/info]")
         return
@@ -1602,7 +1631,7 @@ def search_flow_with_query(query: str, base_path: str) -> str:
     
     return "back"
 #--Search flows-------------------
-def search_flow(base_path: str) -> str:
+def search_flow(base_path: str, db: LibraryDB = None, failed_log: FailedLog = None) -> str:
     """Natively search YouTube using yt-dlp and display with Rich Table"""
     while True:
         console.print(Rule(style="cyan"))
@@ -1655,7 +1684,7 @@ def search_flow(base_path: str) -> str:
             res = load_and_route(url, base_path)
             if res == "quit": return "quit"
 
-def playlist_flow(url: str, base_path: str) -> str:
+def playlist_flow(url: str, base_path: str, db: LibraryDB = None, failed_log: FailedLog = None) -> str:
     """Natively extract a YouTube playlist via yt-dlp and download items cleanly."""
     v_dir, a_dir = get_subdirs(base_path)
     has_ffmpeg = check_ffmpeg()
@@ -1733,7 +1762,8 @@ def playlist_flow(url: str, base_path: str) -> str:
                 download_audio_format(
                     video_url=video_url, 
                     out_dir=base_path, 
-                    format_choice=audio_choice
+                    format_choice=audio_choice,
+                    db=db
                 )
                 
         except Exception as e:
